@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use solana_sdk::bs58;
 
 use crate::mpl_metadata;
 
@@ -45,12 +46,13 @@ impl SqliteIndexer {
 
         // Open database.
         let db = Self::create_db(&db_temp_path)?;
+        let min_batch_size: i64 = 50;
 
         // Create progress bars.
         let spinner_style = ProgressStyle::with_template(
             "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11}",
         )
-        .unwrap();
+            .unwrap();
         let multi_progress = MultiProgress::new();
         let accounts_counter = ProgressCounter::new(
             multi_progress.add(
@@ -108,7 +110,7 @@ CREATE TABLE account  (
         db.execute(
             "\
 CREATE TABLE token_mint (
-    pubkey BLOB(32) NOT NULL PRIMARY KEY,
+    pubkey TEXT(32) NOT NULL PRIMARY KEY,
     mint_authority BLOB(32) NULL,
     supply INTEGER(8) NOT NULL,
     decimals INTEGER(2) NOT NULL,
@@ -120,11 +122,11 @@ CREATE TABLE token_mint (
         db.execute(
             "\
 CREATE TABLE token_account (
-    pubkey BLOB(32) NOT NULL PRIMARY KEY,
-    mint BLOB(32) NOT NULL,
-    owner BLOB(32) NOT NULL,
+    pubkey TEXT(32) NOT NULL PRIMARY KEY,
+    mint TEXT(32) NOT NULL,
+    owner TEXT(32) NOT NULL,
     amount INTEGER(8) NOT NULL,
-    delegate BLOB(32),
+    delegate TEXT(32),
     state INTEGER(1) NOT NULL,
     is_native INTEGER(8),
     delegated_amount INTEGER(8) NOT NULL,
@@ -146,9 +148,11 @@ CREATE TABLE token_multisig (
         db.execute(
             "\
 CREATE TABLE token_metadata (
-    pubkey BLOB(32) NOT NULL,
-    mint BLOB(32) NOT NULL,
+    pubkey TEXT(32) NOT NULL,
+    mint TEXT(32) NOT NULL,
     name TEXT(32) NOT NULL,
+    update_authority TEXT(32) NULL,
+    creators TEXT NULL,
     symbol TEXT(10) NOT NULL,
     uri TEXT(200) NOT NULL,
     seller_fee_basis_points INTEGER(4) NOT NULL,
@@ -160,6 +164,8 @@ CREATE TABLE token_metadata (
 );",
             [],
         )?;
+        db.execute("CREATE INDEX token_metadata_mint_idx ON token_metadata(mint);", [])?;
+        db.execute("CREATE INDEX token_account_mint_idx ON token_account(mint);", [])?;
         Ok(db)
     }
 
@@ -174,6 +180,7 @@ CREATE TABLE token_metadata (
             db: &self.db,
             progress: Arc::clone(&self.progress),
         };
+
         for append_vec in iterator {
             worker.on_append_vec(append_vec?)?;
         }
@@ -204,7 +211,7 @@ impl<'a> AppendVecConsumer for Worker<'a> {
 
 impl<'a> Worker<'a> {
     fn insert_account(&mut self, account: &StoredAccountMeta) -> Result<()> {
-        self.insert_account_meta(account)?;
+        // self.insert_account_meta(account)?;
         if account.account_meta.owner == spl_token::id() {
             self.insert_token(account)?;
         }
@@ -215,22 +222,22 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    fn insert_account_meta(&mut self, account: &StoredAccountMeta) -> Result<()> {
-        let mut account_insert = self.db.prepare_cached(
-            "\
-INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, rent_epoch)
-    VALUES (?, ?, ?, ?, ?, ?);",
-        )?;
-        account_insert.insert(params![
-            account.meta.pubkey.as_ref(),
-            account.meta.data_len as i64,
-            account.account_meta.owner.as_ref(),
-            account.account_meta.lamports as i64,
-            account.account_meta.executable,
-            account.account_meta.rent_epoch as i64,
-        ])?;
-        Ok(())
-    }
+//     fn insert_account_meta(&mut self, account: &StoredAccountMeta) -> Result<()> {
+//         let mut account_insert = self.db.prepare_cached(
+//             "\
+// INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, rent_epoch)
+//     VALUES (?, ?, ?, ?, ?, ?);",
+//         )?;
+//         account_insert.insert(params![
+//             account.meta.pubkey.as_ref(),
+//             account.meta.data_len as i64,
+//             account.account_meta.owner.as_ref(),
+//             account.account_meta.lamports as i64,
+//             account.account_meta.executable,
+//             account.account_meta.rent_epoch as i64,
+//         ])?;
+//         Ok(())
+//     }
 
     fn insert_token(&mut self, account: &StoredAccountMeta) -> Result<()> {
         match account.meta.data_len as usize {
@@ -245,8 +252,8 @@ INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, r
                 }
             }
             spl_token::state::Multisig::LEN => {
-                if let Ok(token_multisig) = spl_token::state::Multisig::unpack(account.data) {
-                    self.insert_token_multisig(account, &token_multisig)?;
+                if let Ok(_token_multisig) = spl_token::state::Multisig::unpack(account.data) {
+                    // self.insert_token_multisig(account, &token_multisig)?;
                 }
             }
             _ => {
@@ -266,13 +273,14 @@ INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, r
         account: &StoredAccountMeta,
         token_account: &spl_token::state::Account,
     ) -> Result<()> {
-        let mut token_account_insert = self.db.prepare_cached("\
+        if token_account.amount as i64 == 1 {
+            let mut token_account_insert = self.db.prepare_cached("\
 INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, state, is_native, delegated_amount, close_authority)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);")?;
-        token_account_insert.insert(params![
-            account.meta.pubkey.as_ref(),
-            token_account.mint.as_ref(),
-            token_account.owner.as_ref(),
+            token_account_insert.insert(params![
+            bs58::encode(account.meta.pubkey.as_ref()).into_string(),
+            bs58::encode(token_account.mint.as_ref()).into_string(),
+            bs58::encode(token_account.owner.as_ref()).into_string(),
             token_account.amount as i64,
             Option::<[u8; 32]>::from(token_account.delegate.map(|key| key.to_bytes())),
             token_account.state as u8,
@@ -280,6 +288,7 @@ INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, sta
             token_account.delegated_amount as i64,
             Option::<[u8; 32]>::from(token_account.close_authority.map(|key| key.to_bytes())),
         ])?;
+        }
         Ok(())
     }
 
@@ -288,40 +297,42 @@ INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, sta
         account: &StoredAccountMeta,
         token_mint: &spl_token::state::Mint,
     ) -> Result<()> {
-        let mut token_mint_insert = self.db.prepare_cached("\
+        if token_mint.supply as i64 == 1 {
+            let mut token_mint_insert = self.db.prepare_cached("\
 INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_initialized, freeze_authority)
     VALUES (?, ?, ?, ?, ?, ?);")?;
-        token_mint_insert.insert(params![
-            account.meta.pubkey.as_ref(),
+            token_mint_insert.insert(params![
+            bs58::encode(account.meta.pubkey.as_ref()).into_string(),
             Option::<[u8; 32]>::from(token_mint.mint_authority.map(|key| key.to_bytes()),),
             token_mint.supply as i64,
             token_mint.decimals,
             token_mint.is_initialized,
             Option::<[u8; 32]>::from(token_mint.freeze_authority.map(|key| key.to_bytes())),
         ])?;
-        Ok(())
-    }
-
-    fn insert_token_multisig(
-        &mut self,
-        account: &StoredAccountMeta,
-        token_multisig: &spl_token::state::Multisig,
-    ) -> Result<()> {
-        let mut token_multisig_insert = self.db.prepare_cached(
-            "\
-INSERT OR REPLACE INTO token_multisig (pubkey, signer, m, n)
-    VALUES (?, ?, ?, ?);",
-        )?;
-        for signer in &token_multisig.signers[..token_multisig.n as usize] {
-            token_multisig_insert.insert(params![
-                account.meta.pubkey.as_ref(),
-                signer.as_ref(),
-                token_multisig.m,
-                token_multisig.n
-            ])?;
         }
         Ok(())
     }
+
+//     fn insert_token_multisig(
+//         &mut self,
+//         account: &StoredAccountMeta,
+//         token_multisig: &spl_token::state::Multisig,
+//     ) -> Result<()> {
+//         let mut token_multisig_insert = self.db.prepare_cached(
+//             "\
+// INSERT OR REPLACE INTO token_multisig (pubkey, signer, m, n)
+//     VALUES (?, ?, ?, ?);",
+//         )?;
+//         for signer in &token_multisig.signers[..token_multisig.n as usize] {
+//             token_multisig_insert.insert(params![
+//                 account.meta.pubkey.as_ref(),
+//                 signer.as_ref(),
+//                 token_multisig.m,
+//                 token_multisig.n
+//             ])?;
+//         }
+//         Ok(())
+//     }
 
     fn insert_token_metadata(&mut self, account: &StoredAccountMeta) -> Result<()> {
         if account.data.is_empty() {
@@ -367,6 +378,7 @@ INSERT OR REPLACE INTO token_multisig (pubkey, signer, m, n)
         meta_v1_2: Option<&mpl_metadata::MetadataExtV1_2>,
     ) -> Result<()> {
         let collection = meta_v1_2.as_ref().and_then(|m| m.collection.as_ref());
+
         self.db
             .prepare_cached(
                 "\
@@ -374,6 +386,8 @@ INSERT OR REPLACE INTO token_metadata (
     pubkey,
     mint,
     name,
+    update_authority,
+    creators,
     symbol,
     uri,
     seller_fee_basis_points,
@@ -382,12 +396,16 @@ INSERT OR REPLACE INTO token_metadata (
     edition_nonce,
     collection_verified,
     collection_key
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
             )?
             .insert(params![
-                account.meta.pubkey.as_ref(),
-                meta_v1.mint.as_ref(),
+                bs58::encode(account.meta.pubkey.as_ref()).into_string(),
+                bs58::encode(meta_v1.mint.as_ref()).into_string(),
                 meta_v1.data.name,
+                bs58::encode(meta_v1.update_authority.as_ref()).into_string(),
+                if !meta_v1.data.creators.is_none() {
+            Some(serde_json::to_string(&meta_v1.data.creators.as_ref().unwrap().iter().map(|c| bs58::encode(c.address.as_ref()).into_string()).collect::<Vec<String>>())?)
+        } else {None },
                 meta_v1.data.symbol,
                 meta_v1.data.uri,
                 meta_v1.data.seller_fee_basis_points,
@@ -395,7 +413,7 @@ INSERT OR REPLACE INTO token_metadata (
                 meta_v1.is_mutable,
                 meta_v1_1.map(|c| c.edition_nonce),
                 collection.map(|c| c.verified),
-                collection.map(|c| c.key.as_ref()),
+                collection.map(|c| bs58::encode(c.key.as_ref()).into_string()),
             ])?;
         Ok(())
     }

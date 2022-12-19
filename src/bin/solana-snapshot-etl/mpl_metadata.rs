@@ -1,5 +1,6 @@
 use borsh::BorshDeserialize;
 use solana_program::pubkey::Pubkey;
+use serde::{Serialize};
 
 solana_program::declare_id!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 
@@ -58,7 +59,7 @@ pub struct DataV2 {
     pub uses: Option<Uses>,
 }
 
-#[derive(BorshDeserialize)]
+#[derive(BorshDeserialize, Serialize)]
 pub struct Creator {
     pub address: Pubkey,
     pub verified: bool,
