@@ -1,7 +1,7 @@
 use borsh::BorshDeserialize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, warn};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection};
 use solana_sdk::program_pack::Pack;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
 use solana_snapshot_etl::parallel::{AppendVecConsumer, GenericResult};
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use rusqlite::types::Null;
 use solana_sdk::bs58;
 
 use crate::mpl_metadata;
@@ -46,7 +47,7 @@ impl SqliteIndexer {
 
         // Open database.
         let db = Self::create_db(&db_temp_path)?;
-        let min_batch_size: i64 = 50;
+
 
         // Create progress bars.
         let spinner_style = ProgressStyle::with_template(
@@ -94,7 +95,9 @@ impl SqliteIndexer {
         let db = Connection::open(&path)?;
         db.pragma_update(None, "synchronous", false)?;
         db.pragma_update(None, "journal_mode", "off")?;
-        db.pragma_update(None, "locking_mode", "exclusive")?;
+        db.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        db.pragma_update(None, "temp_store", "MEMORY")?;
+        db.pragma_update(None, "cache_size", -2000000)?;
         db.execute(
             "\
 CREATE TABLE account  (
@@ -176,14 +179,34 @@ CREATE TABLE token_metadata (
     }
 
     pub(crate) fn insert_all(mut self, iterator: AppendVecIterator) -> Result<IndexStats> {
-        let mut worker = Worker {
+        let mut worker: Worker = Worker {
             db: &self.db,
             progress: Arc::clone(&self.progress),
+            token_metadata_counter: 0,
+            token_metadata_params: Vec::new(),
+            batch_size: 50,
+            token_mint_counter: 0,
+            token_mint_params: Vec::new(),
+            token_account_counter: 0,
+            token_account_params: Vec::new(),
         };
 
         for append_vec in iterator {
             worker.on_append_vec(append_vec?)?;
         }
+
+        if worker.token_metadata_counter > 0 {
+            worker.insert_token_metadata_metadata()?;
+        }
+
+        if worker.token_mint_counter > 0 {
+            worker.insert_token_mint()?;
+        }
+
+        if worker.token_account_counter > 0 {
+            worker.insert_token_account()?;
+        }
+
         self.db.pragma_update(None, "query_only", true)?;
         let stats = IndexStats {
             accounts_total: self.progress.accounts_counter.get(),
@@ -198,6 +221,15 @@ CREATE TABLE token_metadata (
 struct Worker<'a> {
     db: &'a Connection,
     progress: Arc<Progress>,
+    token_metadata_counter: i32,
+    token_metadata_params: Vec<rusqlite::types::Value>,
+    batch_size: i32,
+
+    token_mint_counter: i32,
+    token_mint_params: Vec<rusqlite::types::Value>,
+
+    token_account_counter: i32,
+    token_account_params: Vec<rusqlite::types::Value>,
 }
 
 impl<'a> AppendVecConsumer for Worker<'a> {
@@ -243,12 +275,26 @@ impl<'a> Worker<'a> {
         match account.meta.data_len as usize {
             spl_token::state::Account::LEN => {
                 if let Ok(token_account) = spl_token::state::Account::unpack(account.data) {
-                    self.insert_token_account(account, &token_account)?;
+                    let p = self.prepare_token_account_params(account, &token_account)?;
+                    self.token_account_params.extend(p);
+                    self.token_account_counter = self.token_account_counter + 1;
+
+                    if self.token_account_counter == self.batch_size {
+                        self.insert_token_account()?;
+                    }
                 }
             }
             spl_token::state::Mint::LEN => {
                 if let Ok(token_mint) = spl_token::state::Mint::unpack(account.data) {
-                    self.insert_token_mint(account, &token_mint)?;
+                    if token_mint.supply as i64 == 1 {
+                        let p = self.prepare_token_mint_params(account, &token_mint)?;
+                        self.token_mint_params.extend(p);
+                        self.token_mint_counter = self.token_mint_counter + 1;
+
+                        if self.token_mint_counter == self.batch_size {
+                            self.insert_token_mint()?;
+                        }
+                    }
                 }
             }
             spl_token::state::Multisig::LEN => {
@@ -268,48 +314,70 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    fn insert_token_account(
+    fn prepare_token_account_params(
         &mut self,
         account: &StoredAccountMeta,
         token_account: &spl_token::state::Account,
+    ) -> Result<Vec<rusqlite::types::Value>> {
+        let p = vec![
+            rusqlite::types::Value::from(bs58::encode(account.meta.pubkey.as_ref()).into_string()),
+            rusqlite::types::Value::from(bs58::encode(token_account.mint.as_ref()).into_string()),
+            rusqlite::types::Value::from(bs58::encode(token_account.owner.as_ref()).into_string()),
+            rusqlite::types::Value::from(token_account.amount as i64),
+            rusqlite::types::Value::from(Option::<String>::from(token_account.delegate.map(|key| bs58::encode(key.as_ref()).into_string()))),
+            rusqlite::types::Value::from(token_account.state as u8),
+            rusqlite::types::Value::from(Option::<i64>::from(token_account.is_native.map(|i| i as i64))),
+            rusqlite::types::Value::from(token_account.delegated_amount as i64),
+            rusqlite::types::Value::from(Option::<String>::from(token_account.close_authority.map(|key| bs58::encode(key.as_ref()).into_string()))),
+        ];
+
+        Ok(p)
+    }
+
+    fn insert_token_account(
+        &mut self,
     ) -> Result<()> {
-        if token_account.amount as i64 == 1 {
-            let mut token_account_insert = self.db.prepare_cached("\
-INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, state, is_native, delegated_amount, close_authority)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);")?;
-            token_account_insert.insert(params![
-            bs58::encode(account.meta.pubkey.as_ref()).into_string(),
-            bs58::encode(token_account.mint.as_ref()).into_string(),
-            bs58::encode(token_account.owner.as_ref()).into_string(),
-            token_account.amount as i64,
-            Option::<[u8; 32]>::from(token_account.delegate.map(|key| key.to_bytes())),
-            token_account.state as u8,
-            Option::<u64>::from(token_account.is_native),
-            token_account.delegated_amount as i64,
-            Option::<[u8; 32]>::from(token_account.close_authority.map(|key| key.to_bytes())),
-        ])?;
-        }
+        let mut with_params = " (?, ?, ?, ?, ?, ?, ?, ?, ?),".repeat(self.token_account_counter as usize);
+        with_params.pop();
+        let with_params = with_params.as_str();
+
+        let st = format!("INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, state, is_native, delegated_amount, close_authority) VALUES {}", with_params);
+        let mut stmt = self.db.prepare_cached(st.as_str()).unwrap();
+        stmt.execute(rusqlite::params_from_iter(&self.token_account_params)).unwrap();
+        self.token_account_params.clear();
+        self.token_account_counter = 0;
         Ok(())
+    }
+
+    fn prepare_token_mint_params(
+        &mut self,
+        account: &StoredAccountMeta,
+        token_mint: &spl_token::state::Mint,
+    ) -> Result<Vec<rusqlite::types::Value>> {
+        let p = vec![
+            rusqlite::types::Value::from(bs58::encode(account.meta.pubkey.as_ref()).into_string()),
+            rusqlite::types::Value::from(Option::<String>::from(token_mint.mint_authority.map(|key| bs58::encode(key.as_ref()).into_string()))),
+            rusqlite::types::Value::from(token_mint.supply as i64),
+            rusqlite::types::Value::from(token_mint.decimals),
+            rusqlite::types::Value::from(token_mint.is_initialized),
+            rusqlite::types::Value::from(Option::<String>::from(token_mint.freeze_authority.map(|key| bs58::encode(key.as_ref()).into_string()))),
+        ];
+
+        Ok(p)
     }
 
     fn insert_token_mint(
         &mut self,
-        account: &StoredAccountMeta,
-        token_mint: &spl_token::state::Mint,
     ) -> Result<()> {
-        if token_mint.supply as i64 == 1 {
-            let mut token_mint_insert = self.db.prepare_cached("\
-INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_initialized, freeze_authority)
-    VALUES (?, ?, ?, ?, ?, ?);")?;
-            token_mint_insert.insert(params![
-            bs58::encode(account.meta.pubkey.as_ref()).into_string(),
-            Option::<[u8; 32]>::from(token_mint.mint_authority.map(|key| key.to_bytes()),),
-            token_mint.supply as i64,
-            token_mint.decimals,
-            token_mint.is_initialized,
-            Option::<[u8; 32]>::from(token_mint.freeze_authority.map(|key| key.to_bytes())),
-        ])?;
-        }
+        let mut with_params = " (?, ?, ?, ?, ?, ?),".repeat(self.token_mint_counter as usize);
+        with_params.pop();
+        let with_params = with_params.as_str();
+
+        let st = format!("INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_initialized, freeze_authority) VALUES {}", with_params);
+        let mut stmt = self.db.prepare_cached(st.as_str()).unwrap();
+        stmt.execute(rusqlite::params_from_iter(&self.token_mint_params)).unwrap();
+        self.token_mint_params.clear();
+        self.token_mint_counter = 0;
         Ok(())
     }
 
@@ -357,32 +425,64 @@ INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_
                     .as_ref()
                     .and_then(|_| mpl_metadata::MetadataExtV1_2::deserialize(&mut data_peek).ok());
 
-                self.insert_token_metadata_metadata(
+                let p = self.prepare_token_metadata_params(
                     account,
                     &meta_v1,
                     meta_v1_1.as_ref(),
                     meta_v1_2.as_ref(),
                 )?;
+
+                self.token_metadata_params.extend(p);
+                self.token_metadata_counter = self.token_metadata_counter + 1;
             }
             _ => return Ok(()), // TODO
         }
+
+        if self.token_metadata_counter == self.batch_size {
+            self.insert_token_metadata_metadata()?;
+        }
+
         self.progress.metaplex_accounts_counter.inc();
         Ok(())
     }
 
-    fn insert_token_metadata_metadata(
-        &mut self,
+    fn prepare_token_metadata_params(
+        &self,
         account: &StoredAccountMeta,
         meta_v1: &mpl_metadata::Metadata,
         meta_v1_1: Option<&mpl_metadata::MetadataExt>,
         meta_v1_2: Option<&mpl_metadata::MetadataExtV1_2>,
-    ) -> Result<()> {
+    ) -> Result<Vec<rusqlite::types::Value>> {
         let collection = meta_v1_2.as_ref().and_then(|m| m.collection.as_ref());
+        let p = vec![
+            rusqlite::types::Value::from(bs58::encode(account.meta.pubkey.as_ref().to_owned()).into_string()),
+            rusqlite::types::Value::from(bs58::encode(meta_v1.mint.as_ref()).into_string()),
+            rusqlite::types::Value::from(meta_v1.data.name.clone()),
+            rusqlite::types::Value::from(bs58::encode(meta_v1.update_authority.as_ref()).into_string()),
+            if !meta_v1.data.creators.is_none() {
+                rusqlite::types::Value::from(Some(serde_json::to_string(&meta_v1.data.creators.as_ref().unwrap().iter().map(|c| bs58::encode(c.address.as_ref()).into_string()).collect::<Vec<String>>())?))
+            } else { rusqlite::types::Value::from(Null) },
+            rusqlite::types::Value::from(meta_v1.data.symbol.clone()),
+            rusqlite::types::Value::from(meta_v1.data.uri.clone()),
+            rusqlite::types::Value::from(meta_v1.data.seller_fee_basis_points),
+            rusqlite::types::Value::from(meta_v1.primary_sale_happened),
+            rusqlite::types::Value::from(meta_v1.is_mutable),
+            rusqlite::types::Value::from(meta_v1_1.map(|c| c.edition_nonce)),
+            rusqlite::types::Value::from(collection.map(|c| c.verified)),
+            rusqlite::types::Value::from(collection.map(|c| bs58::encode(c.key.as_ref()).into_string())),
+        ];
+        Ok(p)
+    }
 
-        self.db
-            .prepare_cached(
-                "\
-INSERT OR REPLACE INTO token_metadata (
+    fn insert_token_metadata_metadata(
+        &mut self,
+    ) -> Result<()> {
+        let mut with_params = " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),".repeat(self.token_metadata_counter as usize);
+        with_params.pop();
+        let with_params = with_params.as_str();
+
+        let st = format!("\
+        INSERT OR REPLACE INTO token_metadata (
     pubkey,
     mint,
     name,
@@ -396,25 +496,11 @@ INSERT OR REPLACE INTO token_metadata (
     edition_nonce,
     collection_verified,
     collection_key
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            )?
-            .insert(params![
-                bs58::encode(account.meta.pubkey.as_ref()).into_string(),
-                bs58::encode(meta_v1.mint.as_ref()).into_string(),
-                meta_v1.data.name,
-                bs58::encode(meta_v1.update_authority.as_ref()).into_string(),
-                if !meta_v1.data.creators.is_none() {
-            Some(serde_json::to_string(&meta_v1.data.creators.as_ref().unwrap().iter().map(|c| bs58::encode(c.address.as_ref()).into_string()).collect::<Vec<String>>())?)
-        } else {None },
-                meta_v1.data.symbol,
-                meta_v1.data.uri,
-                meta_v1.data.seller_fee_basis_points,
-                meta_v1.primary_sale_happened,
-                meta_v1.is_mutable,
-                meta_v1_1.map(|c| c.edition_nonce),
-                collection.map(|c| c.verified),
-                collection.map(|c| bs58::encode(c.key.as_ref()).into_string()),
-            ])?;
+) VALUES {}", with_params);
+        let mut stmt = self.db.prepare_cached(st.as_str()).unwrap();
+        stmt.execute(rusqlite::params_from_iter(&self.token_metadata_params)).unwrap();
+        self.token_metadata_params.clear();
+        self.token_metadata_counter = 0;
         Ok(())
     }
 }
