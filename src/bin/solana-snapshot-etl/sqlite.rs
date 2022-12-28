@@ -184,7 +184,7 @@ CREATE TABLE token_metadata (
             progress: Arc::clone(&self.progress),
             token_metadata_counter: 0,
             token_metadata_params: Vec::new(),
-            batch_size: 50,
+            batch_size: 200,
             token_mint_counter: 0,
             token_mint_params: Vec::new(),
             token_account_counter: 0,
